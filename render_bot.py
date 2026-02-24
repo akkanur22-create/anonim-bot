@@ -692,7 +692,7 @@ def webhook():
     """Сюда Telegram будет присылать обновления"""
     if application:
             update = Update.de_json(request.get_json(force=True), application.bot)
-            asyncio.run_coroutine_threadsafe(application.process_update(update), application.loop)
+            asyncio.create_task(application.process_update(update))
     return 'OK', 200
 
 # Глобальная переменная для приложения бота
