@@ -695,7 +695,7 @@ def webhook():
         # Создаём новую задачу в цикле событий приложения
         asyncio.run_coroutine_threadsafe(
             application.process_update(update),
-            asyncio.get_event_loop()
+            application._loop  # Используем внутренний цикл приложения
         )
     return 'OK', 200
 
