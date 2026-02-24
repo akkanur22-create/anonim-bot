@@ -1,14 +1,173 @@
 import logging
 import os
 import asyncio
+import random
+import string
+from datetime import datetime
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
     filters, ContextTypes, CallbackQueryHandler
 )
-from database import Database
 
+# ============================================
+# ===         КЛАСС DATABASE               ===
+# ============================================
+class Database:
+    def __init__(self, db_name='bot_database.db'):
+        import sqlite3
+        self.conn = sqlite3.connect(db_name, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.create_tables()
+    
+    def create_tables(self):
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                join_date TEXT,
+                unique_link TEXT UNIQUE,
+                is_admin INTEGER DEFAULT 0
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_id INTEGER,
+                sender_id INTEGER,
+                sender_username TEXT,
+                sender_first_name TEXT,
+                message_text TEXT,
+                photo_file_id TEXT,
+                sent_date TEXT,
+                is_read INTEGER DEFAULT 0,
+                reply_to_message_id INTEGER DEFAULT NULL
+            )
+        ''')
+        self.conn.commit()
+    
+    def generate_unique_link(self, length=8):
+        chars = string.ascii_letters + string.digits
+        while True:
+            link = ''.join(random.choice(chars) for _ in range(length))
+            self.cursor.execute("SELECT unique_link FROM users WHERE unique_link = ?", (link,))
+            if not self.cursor.fetchone():
+                return link
+    
+    def add_user(self, user_id, username, first_name):
+        self.cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        existing = self.cursor.fetchone()
+        if existing:
+            return self.get_user_link(user_id)
+        unique_link = self.generate_unique_link()
+        join_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.cursor.execute('''
+            INSERT INTO users (user_id, username, first_name, join_date, unique_link, is_admin)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, first_name, join_date, unique_link, 0))
+        self.conn.commit()
+        return unique_link
+    
+    def set_admin(self, user_id):
+        self.cursor.execute('UPDATE users SET is_admin = 1 WHERE user_id = ?', (user_id,))
+        self.conn.commit()
+        return self.cursor.rowcount > 0
+    
+    def is_admin(self, user_id):
+        self.cursor.execute('SELECT is_admin FROM users WHERE user_id = ?', (user_id,))
+        result = self.cursor.fetchone()
+        return result[0] == 1 if result else False
+    
+    def get_user_link(self, user_id):
+        self.cursor.execute("SELECT unique_link FROM users WHERE user_id = ?", (user_id,))
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+    
+    def get_user_by_link(self, link):
+        self.cursor.execute("SELECT user_id FROM users WHERE unique_link = ?", (link,))
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+    
+    def save_anonymous_message(self, recipient_id, sender_id, sender_username, sender_first_name, 
+                               message_text=None, photo_file_id=None, reply_to_id=None):
+        sent_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.cursor.execute('''
+            INSERT INTO messages (
+                recipient_id, sender_id, sender_username, sender_first_name, 
+                message_text, photo_file_id, sent_date, reply_to_message_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (recipient_id, sender_id, sender_username, sender_first_name, 
+              message_text, photo_file_id, sent_date, reply_to_id))
+        self.conn.commit()
+        return self.cursor.lastrowid
+    
+    def get_user_messages(self, user_id, requesting_user_id=None):
+        is_admin = self.is_admin(requesting_user_id) if requesting_user_id else False
+        if is_admin:
+            self.cursor.execute('''
+                SELECT id, sender_id, sender_username, sender_first_name, 
+                       message_text, photo_file_id, sent_date, is_read, reply_to_message_id
+                FROM messages 
+                WHERE recipient_id = ?
+                ORDER BY sent_date DESC
+            ''', (user_id,))
+            return self.cursor.fetchall()
+        else:
+            self.cursor.execute('''
+                SELECT id, message_text, photo_file_id, sent_date, is_read, reply_to_message_id
+                FROM messages 
+                WHERE recipient_id = ?
+                ORDER BY sent_date DESC
+            ''', (user_id,))
+            return self.cursor.fetchall()
+    
+    def mark_message_as_read(self, message_id):
+        self.cursor.execute('UPDATE messages SET is_read = 1 WHERE id = ?', (message_id,))
+        self.conn.commit()
+    
+    def get_unread_count(self, user_id):
+        self.cursor.execute('SELECT COUNT(*) FROM messages WHERE recipient_id = ? AND is_read = 0', (user_id,))
+        return self.cursor.fetchone()[0]
+    
+    def get_message_by_id(self, message_id, requesting_user_id=None):
+        is_admin = self.is_admin(requesting_user_id) if requesting_user_id else False
+        if is_admin:
+            self.cursor.execute('''
+                SELECT id, sender_id, sender_username, sender_first_name, 
+                       recipient_id, message_text, photo_file_id, sent_date, reply_to_message_id
+                FROM messages WHERE id = ?
+            ''', (message_id,))
+            return self.cursor.fetchone()
+        else:
+            self.cursor.execute('''
+                SELECT id, recipient_id, message_text, photo_file_id, sent_date, reply_to_message_id
+                FROM messages WHERE id = ?
+            ''', (message_id,))
+            return self.cursor.fetchone()
+    
+    def get_all_users(self):
+        self.cursor.execute('SELECT user_id, username, first_name, join_date, unique_link, is_admin FROM users ORDER BY join_date DESC')
+        return self.cursor.fetchall()
+    
+    def get_all_messages_admin(self, limit=100):
+        self.cursor.execute('''
+            SELECT m.id, m.sender_id, m.sender_username, m.sender_first_name,
+                   m.recipient_id, m.message_text, m.photo_file_id, m.sent_date, m.is_read,
+                   u.username, u.first_name
+            FROM messages m
+            LEFT JOIN users u ON m.recipient_id = u.user_id
+            ORDER BY m.sent_date DESC
+            LIMIT ?
+        ''', (limit,))
+        return self.cursor.fetchall()
+
+
+# ============================================
+# ===         НАСТРОЙКИ БОТА               ===
+# ============================================
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -19,8 +178,21 @@ logger = logging.getLogger(__name__)
 # Инициализация базы данных
 db = Database()
 
-# === НАЧАЛО: СЮДА ВСТАВЬТЕ ВСЕ ВАШИ ФУНКЦИИ ИЗ bot.py ===
-# Скопируйте сюда ВСЕ функции из вашего bot.py:|
+# ID администраторов (будут загружены из переменных окружения)
+ADMIN_IDS = []
+try:
+    admin_ids_str = os.environ.get('ADMIN_IDS', '')
+    if admin_ids_str:
+        ADMIN_IDS = [int(id.strip()) for id in admin_ids_str.split(',') if id.strip()]
+except:
+    ADMIN_IDS = []
+
+BOT_USERNAME = os.environ.get('BOT_USERNAME', 'anonim159_bot')
+
+
+# ============================================
+# ===         ФУНКЦИИ ОБРАБОТЧИКИ          ===
+# ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user = update.effective_user
@@ -72,6 +244,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(welcome_message, reply_markup=reply_markup, parse_mode='Markdown')
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
@@ -145,15 +318,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в handle_message: {e}")
         await update.message.reply_text("❌ Произошла ошибка. Попробуйте еще раз.")
 
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик фото"""
     try:
         user = update.effective_user
-        photo = update.message.photo[-1]  # Берем самое большое фото
-        caption = update.message.caption or ""  # Подпись к фото
+        photo = update.message.photo[-1]
+        caption = update.message.caption or ""
         
         if 'recipient' in context.user_data:
-            # Отправка фото новому получателю
             recipient_id = context.user_data['recipient']
             message_id = db.save_anonymous_message(
                 recipient_id=recipient_id,
@@ -166,7 +339,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del context.user_data['recipient']
             await update.message.reply_text("✅ Фото отправлено!")
             
-            # Отправляем уведомление с фото
             try:
                 keyboard = [[InlineKeyboardButton("💬 Ответить", callback_data=f"quick_reply_{message_id}")]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -182,7 +354,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Не удалось отправить уведомление: {e}")
         
         elif 'replying_to' in context.user_data:
-            # Ответ фото на сообщение
             reply_data = context.user_data['replying_to']
             message_id = db.save_anonymous_message(
                 recipient_id=reply_data['sender_id'],
@@ -196,7 +367,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del context.user_data['replying_to']
             await update.message.reply_text("✅ Ответ с фото отправлен!")
             
-            # Уведомляем о ответе с фото
             try:
                 keyboard = [[InlineKeyboardButton("💬 Ответить", callback_data=f"quick_reply_{message_id}")]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -218,6 +388,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в handle_photo: {e}")
         await update.message.reply_text("❌ Произошла ошибка при отправке фото.")
 
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на кнопки"""
     try:
@@ -227,27 +398,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         is_admin = user_id in ADMIN_IDS
         
-        # === БЫСТРЫЙ ОТВЕТ ИЗ УВЕДОМЛЕНИЯ ===
+        # Быстрый ответ из уведомления
         if query.data.startswith("quick_reply_"):
             message_id = int(query.data.split("_")[2])
             message = db.get_message_by_id(message_id, requesting_user_id=user_id)
             
             if message:
-                if is_admin:
-                    # Для админа: id, sender_id, s_username, s_name, recipient_id, msg_text, photo_id, sent_date, reply_to_id
-                    if len(message) >= 9:
-                        msg_id, sender_id, s_username, s_name, recipient_id, msg_text, photo_id, sent_date, reply_to_id = message[:9]
-                    else:
-                        await query.edit_message_text("❌ Ошибка загрузки сообщения")
-                        return
+                if is_admin and len(message) >= 9:
+                    msg_id, sender_id, s_username, s_name, recipient_id, msg_text, photo_id, sent_date, reply_to_id = message[:9]
                 else:
-                    # Для обычных: id, recipient_id, msg_text, photo_id, sent_date, reply_to_id
-                    if len(message) >= 6:
-                        msg_id, recipient_id, msg_text, photo_id, sent_date, reply_to_id = message[:6]
-                        sender_id = recipient_id
-                    else:
-                        await query.edit_message_text("❌ Ошибка загрузки сообщения")
-                        return
+                    msg_id, recipient_id, msg_text, photo_id, sent_date, reply_to_id = message[:6]
+                    sender_id = recipient_id
                 
                 context.user_data['replying_to'] = {
                     'message_id': msg_id,
@@ -272,7 +433,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return
         
-        # === ГЛАВНОЕ МЕНЮ ===
+        # Мои сообщения
         elif query.data == "my_messages":
             messages = db.get_user_messages(user_id, requesting_user_id=user_id)
             
@@ -285,20 +446,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📨 **Ваши сообщения:**", parse_mode='Markdown')
             
             for msg in messages:
-                if is_admin:
-                    # Для админа
-                    if len(msg) >= 9:
-                        msg_id, sender_id, s_username, s_name, msg_text, photo_id, sent_date, is_read, reply_to_id = msg[:9]
-                        header = f"👤 **От:** {s_name} (@{s_username})\n📅 {sent_date}\n{'✅ Прочитано' if is_read else '📌 Непрочитано'}\n"
-                    else:
-                        continue
+                if is_admin and len(msg) >= 9:
+                    msg_id, sender_id, s_username, s_name, msg_text, photo_id, sent_date, is_read, reply_to_id = msg[:9]
+                    header = f"👤 **От:** {s_name} (@{s_username})\n📅 {sent_date}\n{'✅ Прочитано' if is_read else '📌 Непрочитано'}\n"
                 else:
-                    # Для обычных
-                    if len(msg) >= 6:
-                        msg_id, msg_text, photo_id, sent_date, is_read, reply_to_id = msg[:6]
-                        header = f"📅 {sent_date}\n{'✅ Прочитано' if is_read else '📌 Непрочитано'}\n"
-                    else:
-                        continue
+                    msg_id, msg_text, photo_id, sent_date, is_read, reply_to_id = msg[:6]
+                    header = f"📅 {sent_date}\n{'✅ Прочитано' if is_read else '📌 Непрочитано'}\n"
                 
                 content = f"{'📸 [ФОТО] ' if photo_id else '📝 '}{msg_text if msg_text else ''}"
                 preview = header + content[:100] + ('...' if len(content) > 100 else '')
@@ -313,34 +466,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
             return
         
+        # Прочитать сообщение
         elif query.data.startswith("read_"):
             msg_id = int(query.data.split("_")[1])
             db.mark_message_as_read(msg_id)
             
             msg = db.get_message_by_id(msg_id, requesting_user_id=user_id)
             if msg:
-                if is_admin:
-                    if len(msg) >= 9:
-                        msg_id, sender_id, s_username, s_name, recipient_id, msg_text, photo_id, sent_date, reply_to_id = msg[:9]
-                        header = (f"👤 **Отправитель:** {s_name}\n"
-                                 f"📱 Username: @{s_username if s_username else 'Нет'}\n"
-                                 f"🆔 ID: `{sender_id}`\n"
-                                 f"📅 {sent_date}\n\n")
-                    else:
-                        await query.edit_message_text("❌ Ошибка загрузки сообщения")
-                        return
+                if is_admin and len(msg) >= 9:
+                    msg_id, sender_id, s_username, s_name, recipient_id, msg_text, photo_id, sent_date, reply_to_id = msg[:9]
+                    header = (f"👤 **Отправитель:** {s_name}\n"
+                             f"📱 Username: @{s_username if s_username else 'Нет'}\n"
+                             f"🆔 ID: `{sender_id}`\n"
+                             f"📅 {sent_date}\n\n")
                 else:
-                    if len(msg) >= 6:
-                        msg_id, recipient_id, msg_text, photo_id, sent_date, reply_to_id = msg[:6]
-                        header = f"📅 {sent_date}\n\n"
-                    else:
-                        await query.edit_message_text("❌ Ошибка загрузки сообщения")
-                        return
+                    msg_id, recipient_id, msg_text, photo_id, sent_date, reply_to_id = msg[:6]
+                    header = f"📅 {sent_date}\n\n"
                 
                 if reply_to_id:
                     header = f"💬 **Ответ на сообщение #{reply_to_id}**\n\n{header}"
                 
-                # Отправляем фото если есть
                 if photo_id:
                     await context.bot.send_photo(
                         chat_id=user_id,
@@ -348,7 +493,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"{header}📝 **Подпись:** {msg_text if msg_text else 'Без подписи'}",
                         parse_mode='Markdown'
                     )
-                    # Удаляем предыдущее сообщение
                     await query.message.delete()
                 else:
                     text = header + f"📝 **Сообщение:**\n{msg_text}"
@@ -359,24 +503,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
         
+        # Ответить на сообщение
         elif query.data.startswith("reply_"):
             msg_id = int(query.data.split("_")[1])
             msg = db.get_message_by_id(msg_id, requesting_user_id=user_id)
             
             if msg:
-                if is_admin:
-                    if len(msg) >= 9:
-                        msg_id, sender_id, s_username, s_name, recipient_id, msg_text, photo_id, sent_date, reply_to_id = msg[:9]
-                    else:
-                        await query.edit_message_text("❌ Ошибка загрузки сообщения")
-                        return
+                if is_admin and len(msg) >= 9:
+                    msg_id, sender_id, s_username, s_name, recipient_id, msg_text, photo_id, sent_date, reply_to_id = msg[:9]
                 else:
-                    if len(msg) >= 6:
-                        msg_id, recipient_id, msg_text, photo_id, sent_date, reply_to_id = msg[:6]
-                        sender_id = recipient_id
-                    else:
-                        await query.edit_message_text("❌ Ошибка загрузки сообщения")
-                        return
+                    msg_id, recipient_id, msg_text, photo_id, sent_date, reply_to_id = msg[:6]
+                    sender_id = recipient_id
                 
                 context.user_data['replying_to'] = {
                     'message_id': msg_id,
@@ -401,6 +538,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return
         
+        # Моя ссылка
         elif query.data == "my_link":
             link = db.get_user_link(user_id)
             bot_link = f"https://t.me/{BOT_USERNAME}?start={link}"
@@ -411,6 +549,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
         
+        # Помощь
         elif query.data == "help":
             help_text = (
                 "📚 **Как пользоваться ботом:**\n\n"
@@ -426,6 +565,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
         
+        # Админ-панель
         elif query.data == "admin_panel" and is_admin:
             users = db.get_all_users()
             messages = db.get_all_messages_admin(limit=100)
@@ -443,6 +583,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
         
+        # Все пользователи (админ)
         elif query.data == "admin_users" and is_admin:
             users = db.get_all_users()
             text = "👥 **Все пользователи:**\n\n"
@@ -460,6 +601,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
         
+        # Все сообщения (админ)
         elif query.data == "admin_messages" and is_admin:
             messages = db.get_all_messages_admin(limit=20)
             text = "📨 **Последние сообщения:**\n\n"
@@ -478,8 +620,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
         
+        # Назад в меню
         elif query.data == "back_to_menu":
-            # Показываем главное меню
             user = update.effective_user
             unique_link = db.get_user_link(user_id)
             bot_link = f"https://t.me/{BOT_USERNAME}?start={unique_link}"
@@ -513,16 +655,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в button_callback: {e}")
         await query.edit_message_text("❌ Произошла ошибка. Попробуйте еще раз.")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-# - start()
-# - handle_message()
-# - handle_photo() 
-# - button_callback()
-# - error_handler()
-# 
-# Просто выделите их в bot.py и вставьте сюда
-# === КОНЕЦ: функции из bot.py ===
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка: {context.error}")
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ Произошла ошибка. Пожалуйста, попробуйте еще раз или напишите /start"
+            )
+    except:
+        pass
+
+
+# ============================================
+# ===         ЗАПУСК НА RENDER             ===
+# ============================================
 # Настройки для Render
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 PORT = int(os.environ.get('PORT', 5000))
@@ -539,7 +687,7 @@ def home():
 def health():
     return "OK", 200
 
-@flask_app.route(f'/webhook', methods=['POST'])
+@flask_app.route('/webhook', methods=['POST'])
 def webhook():
     """Сюда Telegram будет присылать обновления"""
     if application:
@@ -556,7 +704,7 @@ async def run_bot():
         # Создаём приложение
         application = Application.builder().token(TOKEN).build()
         
-        # === РЕГИСТРИРУЕМ ВСЕ ВАШИ ОБРАБОТЧИКИ ===
+        # Регистрируем все обработчики
         application.add_handler(CommandHandler("start", start))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -568,9 +716,12 @@ async def run_bot():
         await application.start()
         
         # Устанавливаем вебхук
-        webhook_url = f"{RENDER_URL}/webhook"
-        await application.bot.set_webhook(url=webhook_url)
-        logger.info(f"✅ Webhook установлен на {webhook_url}")
+        if RENDER_URL:
+            webhook_url = f"{RENDER_URL}/webhook"
+            await application.bot.set_webhook(url=webhook_url)
+            logger.info(f"✅ Webhook установлен на {webhook_url}")
+        else:
+            logger.warning("⚠️ RENDER_URL не задан, вебхук не установлен")
         
         # Запускаем Flask
         from werkzeug.serving import run_simple
