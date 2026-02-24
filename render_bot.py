@@ -691,8 +691,12 @@ def health():
 def webhook():
     """Сюда Telegram будет присылать обновления"""
     if application:
-            update = Update.de_json(request.get_json(force=True), application.bot)
-            asyncio.create_task(application.process_update(update))
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        # Создаём новую задачу в цикле событий приложения
+        asyncio.run_coroutine_threadsafe(
+            application.process_update(update),
+            asyncio.get_event_loop()
+        )
     return 'OK', 200
 
 # Глобальная переменная для приложения бота
